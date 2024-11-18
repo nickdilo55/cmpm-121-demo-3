@@ -217,3 +217,5 @@ for (let i = -NEIGHBORHOOD_SIZE; i < NEIGHBORHOOD_SIZE; i++) {
     }
   }
 }
+
+// for some reason when i make any changes i get error git: running precommit
