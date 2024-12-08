@@ -11,6 +11,7 @@ const TILE_DEGREES = 1e-4;
 const NEIGHBORHOOD_SIZE = 8;
 const CACHE_SPAWN_PROBABILITY = 0.1;
 const MOVE_STEP = TILE_DEGREES / 2;
+const CACHE_VISIBILITY_RADIUS = 50;
 
 let playerDirection = 0;
 let playerPoints = 0;
@@ -71,50 +72,100 @@ class GameCell {
   }
 }
 
+class CacheMemento {
+  constructor(public coins: string[]) {}
+}
+
+class CacheCaretaker {
+  private mementos: Map<string, CacheMemento> = new Map();
+
+  save(key: string, memento: CacheMemento) {
+    this.mementos.set(key, memento);
+  }
+
+  load(key: string): CacheMemento | undefined {
+    return this.mementos.get(key);
+  }
+
+  saveToLocalStorage() {
+    const serialized = JSON.stringify(
+      Array.from(this.mementos.entries()).map(([key, memento]) => ({
+        key,
+        coins: memento.coins,
+      })),
+    );
+    localStorage.setItem("cacheMementos", serialized);
+  }
+
+  loadFromLocalStorage() {
+    const serialized = localStorage.getItem("cacheMementos");
+    if (serialized) {
+      const data = JSON.parse(serialized);
+      this.mementos.clear();
+      for (const { key, coins } of data) {
+        this.mementos.set(key, new CacheMemento(coins));
+      }
+    }
+  }
+}
+
+const cacheCaretaker = new CacheCaretaker();
+cacheCaretaker.loadFromLocalStorage();
+
 class GameCellFactory {
   private cells: Map<string, GameCell> = new Map();
 
   getCell(lat: number, lng: number): GameCell {
     const key = `${lat}:${lng}`;
     if (!this.cells.has(key)) {
-      this.cells.set(key, new GameCell(lat, lng));
+      const memento = cacheCaretaker.load(key);
+      const coins = memento ? memento.coins : [];
+      this.cells.set(key, new GameCell(lat, lng, coins));
     }
     return this.cells.get(key)!;
   }
 
+  save() {
+    this.cells.forEach((gameCell, key) => {
+      const memento = new CacheMemento(gameCell.coins);
+      cacheCaretaker.save(key, memento);
+    });
+    cacheCaretaker.saveToLocalStorage();
+  }
+
+  load() {
+    cacheCaretaker.loadFromLocalStorage();
+    this.cells = new Map();
+  }
+
+  // Add the clear method
   clear() {
     this.cells.clear();
-  }
-
-  // Save all cache states to localStorage
-  save() {
-    const cacheStates: { [key: string]: string[] } = {};
-    this.cells.forEach((gameCell, key) => {
-      cacheStates[key] = gameCell.coins;
-    });
-    localStorage.setItem("cacheStates", JSON.stringify(cacheStates));
-  }
-
-  // Load all cache states from localStorage
-  load() {
-    const savedCacheStates = localStorage.getItem("cacheStates");
-    if (savedCacheStates) {
-      const cacheStates = JSON.parse(savedCacheStates);
-
-      // Loop over all keys in the cacheStates object
-      for (const key in cacheStates) {
-        const coins = cacheStates[key];
-        const [lat, lng] = key.split(":").map(Number);
-        const gameCell = this.getCell(lat, lng);
-        gameCell.coins = coins;
-      }
-    }
   }
 }
 
 const gameCellFactory = new GameCellFactory();
 
 const visitedRegions = new Set<string>();
+
+function calculateDistance(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number,
+): number {
+  const R = 6371e3; // Earth radius in meters
+  const φ1 = (lat1 * Math.PI) / 180;
+  const φ2 = (lat2 * Math.PI) / 180;
+  const Δφ = ((lat2 - lat1) * Math.PI) / 180;
+  const Δλ = ((lng2 - lng1) * Math.PI) / 180;
+
+  const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c;
+}
 
 // Function to save player coins to localStorage
 function savePlayerCoins() {
@@ -133,15 +184,7 @@ function loadPlayerCoins() {
 }
 
 function saveCacheState() {
-  const cacheStates: { [key: string]: string[] } = {};
-
-  // Loop over all cells in the gameCellFactory's cells Map
-  gameCellFactory["cells"].forEach((gameCell, key) => {
-    cacheStates[key] = gameCell.coins;
-  });
-
-  // Save the cache state to localStorage
-  localStorage.setItem("cacheStates", JSON.stringify(cacheStates));
+  gameCellFactory.save();
 }
 
 function spawnCache(lat: number, lng: number) {
@@ -155,10 +198,13 @@ function spawnCache(lat: number, lng: number) {
   rects.bindTooltip(
     `You found a cache at [${lat.toFixed(6)}, ${lng.toFixed(6)}]!`,
   );
-  rects.addTo(map);
 
-  // Add the cache to the caches array
-  caches.push(rects); // Add cache to the array so we can remove it later
+  // Add the cache to the map but hide it initially
+  rects.addTo(map);
+  rects.setStyle({ opacity: 0, fillOpacity: 0 });
+
+  // Add the cache to the array for management
+  caches.push(rects);
 
   const coinCount = Math.floor(luck([lat, lng, "coinCount"].toString()) * 5);
   for (let serial = 0; serial < coinCount; serial++) {
@@ -169,13 +215,13 @@ function spawnCache(lat: number, lng: number) {
   rects.bindPopup(() => {
     const popupDiv = document.createElement("div");
     popupDiv.innerHTML = `
-        <div> This cache is at [${lat.toFixed(6)}, ${
+      <div> This cache is at [${lat.toFixed(6)}, ${
       lng.toFixed(6)
     }] and contains ${gameCell.coins.length} coin(s). </div>
-        <div> Coins in cache: </div>
-        <ul id="coinList"></ul>
-        <button id="poke" style="color: lightblue;">Collect All Coins</button>
-        <button id="deposit" style="color: lightblue;">Deposit All Coins</button>`;
+      <div> Coins in cache: </div>
+      <ul id="coinList"></ul>
+      <button id="poke" style="color: lightblue;">Collect All Coins</button>
+      <button id="deposit" style="color: lightblue;">Deposit All Coins</button>`;
 
     const coinList = popupDiv.querySelector<HTMLUListElement>("#coinList")!;
     gameCell.coins.forEach((coin) => {
@@ -207,6 +253,27 @@ function spawnCache(lat: number, lng: number) {
     });
 
     return popupDiv;
+  });
+}
+
+function updateCacheVisibility() {
+  const playerPos = playerMarker.getLatLng();
+  caches.forEach((cache) => {
+    const cacheBounds = cache.getBounds();
+    const cacheCenter = cacheBounds.getCenter();
+
+    const distance = calculateDistance(
+      playerPos.lat,
+      playerPos.lng,
+      cacheCenter.lat,
+      cacheCenter.lng,
+    );
+
+    if (distance <= CACHE_VISIBILITY_RADIUS) {
+      cache.setStyle({ opacity: 1, fillOpacity: 0.5 });
+    } else {
+      cache.setStyle({ opacity: 0, fillOpacity: 0 });
+    }
   });
 }
 
@@ -267,6 +334,9 @@ function movePlayer(deltaLat: number, deltaLng: number) {
   playerPathPolyline.setLatLngs(playerPath);
 
   savePlayerState(newPos, playerDirection, playerCoins, playerPoints);
+
+  // Update cache visibility
+  updateCacheVisibility();
 }
 
 function rotatePlayerMarker() {
@@ -308,6 +378,8 @@ function loadPlayerState() {
     statusPanel.innerHTML = `Your coins: ${
       playerCoins.join(", ")
     }. Points: ${playerPoints}`;
+
+    gameCellFactory.load(); // Load cache state
   }
 }
 
